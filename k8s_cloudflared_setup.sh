@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Minikube + Cloudflare Tunnel Setup Script for CyberChief
-# This script automates the setup process for exposing Minikube API via Cloudflare Tunnel
+# For macOS and Linux systems
 
 set -e
 
@@ -22,25 +22,39 @@ CONFIG_FILE="cyberchief_k8s_config.json"
 
 # Function to print colored output
 print_step() {
-    echo -e "${BLUE}[STEP]${NC} $1"
+    printf "${BLUE}[STEP]${NC} %s\n" "$1"
 }
 
 print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    printf "${GREEN}[SUCCESS]${NC} %s\n" "$1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
 }
 
 print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    printf "${RED}[ERROR]${NC} %s\n" "$1"
 }
 
 # Function to check if command exists
 check_command() {
-    if ! command -v $1 &> /dev/null; then
+    if ! command -v "$1" &> /dev/null; then
         print_error "$1 is not installed or not in PATH"
+        case "$1" in
+            "docker")
+                print_error "Install Docker from https://docs.docker.com/get-docker/"
+                ;;
+            "minikube")
+                print_error "Install Minikube from https://minikube.sigs.k8s.io/docs/start/"
+                ;;
+            "cloudflared")
+                print_error "Install Cloudflared from https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/"
+                ;;
+            "kubectl")
+                print_error "Install kubectl from https://kubernetes.io/docs/tasks/tools/"
+                ;;
+        esac
         exit 1
     fi
 }
@@ -56,7 +70,7 @@ wait_for_api_server() {
             print_success "Kubernetes API server is ready"
             return 0
         fi
-        echo "Attempt $attempt/$max_attempts - API server not ready yet, waiting..."
+        printf "Attempt %d/%d - API server not ready yet, waiting...\n" "$attempt" "$max_attempts"
         sleep 10
         ((attempt++))
     done
@@ -67,40 +81,67 @@ wait_for_api_server() {
 
 # Function to get minikube API port
 get_minikube_port() {
-    print_step "Finding Minikube API port..."
-    local port=$(docker ps --filter "name=minikube" --format "table {{.Ports}}" | grep "8443/tcp" | head -1 | sed -n 's/.*127\.0\.0\.1:\([0-9]*\)->8443\/tcp.*/\1/p')
+    local port=""
     
+    # Method 1: Use minikube command (most reliable)
+    if server_url=$(minikube kubectl -- config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null); then
+        port=$(echo "$server_url" | grep -oE ':[0-9]+$' | cut -d':' -f2)
+    fi
+    
+    # Method 2: Docker inspect (fallback)
     if [ -z "$port" ]; then
-        print_error "Could not find Minikube API port mapping"
+        port=$(docker inspect minikube --format='{{range $p, $conf := .NetworkSettings.Ports}}{{if eq $p "8443/tcp"}}{{range $conf}}{{.HostPort}}{{end}}{{end}}{{end}}' 2>/dev/null || echo "")
+    fi
+    
+    # Method 3: Docker ps parsing (last resort)
+    if [ -z "$port" ]; then
+        port=$(docker ps --filter "name=minikube" --format "{{.Ports}}" --no-trunc | grep -oE '127\.0\.0\.1:[0-9]+->8443/tcp' | head -1 | cut -d':' -f2 | cut -d'-' -f1)
+    fi
+    
+    # Clean and validate port
+    port=$(echo "$port" | tr -d '[:space:]' | grep -oE '^[0-9]+$')
+    
+    if [ -z "$port" ] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        print_error "Could not find valid Minikube API port"
+        print_error "Debug information:"
+        print_error "Minikube status:"
+        minikube status || true
+        print_error "Docker containers:"
+        docker ps --filter "name=minikube" || true
         exit 1
     fi
     
-    echo $port
+    echo "$port"
 }
 
 # Function to start cloudflare tunnel
 start_tunnel() {
-    local port=$1
+    local port="$1"
+    
+    if [ -z "$port" ] || ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        print_error "Invalid port provided: '$port'"
+        exit 1
+    fi
+    
     print_step "Starting Cloudflare tunnel on port $port..."
     
-    # Start tunnel in background and capture output
-    cloudflared tunnel --url https://localhost:$port --no-tls-verify > $TUNNEL_LOG_FILE 2>&1 &
+    # Ensure directory exists
+    mkdir -p "$(dirname "$TUNNEL_LOG_FILE")"
+    
+    # Start tunnel in background
+    cloudflared tunnel --url "https://localhost:$port" --no-tls-verify > "$TUNNEL_LOG_FILE" 2>&1 &
     local tunnel_pid=$!
     
-    # Save PID for later cleanup
-    echo $tunnel_pid > $TUNNEL_PID_FILE
+    # Save PID
+    echo "$tunnel_pid" > "$TUNNEL_PID_FILE"
     
-    # Create Log File
-    touch $TUNNEL_LOG_FILE
-
-    # Wait for tunnel to establish and get URL
-    print_step "Waiting for tunnel to establish and output URL..."
+    print_step "Waiting for tunnel to establish..."
     local max_attempts=30
     local attempt=1
     local tunnel_url=""
 
     while [ $attempt -le $max_attempts ]; do
-        if grep -q "trycloudflare.com" "$TUNNEL_LOG_FILE"; then
+        if [ -f "$TUNNEL_LOG_FILE" ] && grep -q "trycloudflare.com" "$TUNNEL_LOG_FILE"; then
             tunnel_url=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" "$TUNNEL_LOG_FILE" | head -1)
             if [ -n "$tunnel_url" ]; then
                 echo "$tunnel_url" > "$TUNNEL_URL_FILE"
@@ -108,103 +149,89 @@ start_tunnel() {
                 return 0
             fi
         fi
-        echo "Attempt $attempt/$max_attempts - Waiting for Cloudflare tunnel URL..."
+        printf "Attempt %d/%d - Waiting for Cloudflare tunnel URL...\n" "$attempt" "$max_attempts"
         sleep 2
         ((attempt++))
     done
 
     print_error "Failed to extract tunnel URL after $max_attempts attempts"
-    kill $tunnel_pid 2>/dev/null || true
+    print_error "Tunnel log contents:"
+    cat "$TUNNEL_LOG_FILE" 2>/dev/null || print_error "Could not read log file"
+    kill "$tunnel_pid" 2>/dev/null || true
     exit 1
 }
 
-# Function to run k8s_trivy_setup.sh
+# Function to setup Trivy configuration
 setup_trivy_config() {
     print_step "Setting up Trivy configuration..."
     
-    # Check if k8s_trivy_setup.sh exists
     if [ ! -f "k8s_trivy_setup.sh" ]; then
         print_warning "k8s_trivy_setup.sh not found in current directory"
-        print_warning "Please download it from your workspace admin and place it in the current directory to continue"
+        print_warning "This is optional - continuing with default service account"
         return 1
     fi
     
-    # Make executable and run with the specified namespace
     chmod +x k8s_trivy_setup.sh
-    print_step "Running k8s_trivy_setup.sh to create service account and RBAC..."
+    print_step "Running k8s_trivy_setup.sh..."
     
     if ./k8s_trivy_setup.sh "$NAMESPACE"; then
-        # The script creates k8s_cluster_config.json, let's use that
         if [ -f "k8s_cluster_config.json" ]; then
             cp k8s_cluster_config.json /tmp/trivy_output.json
-            print_success "Trivy setup completed - RBAC and service account created"
-            print_success "Configuration saved to k8s_cluster_config.json"
+            print_success "Trivy setup completed"
             return 0
-        else
-            print_error "k8s_cluster_config.json was not created by k8s_trivy_setup.sh"
-            return 1
         fi
+    fi
+    
+    print_warning "Trivy setup failed, continuing with default service account"
+    return 1
+}
+
+# Function to extract JSON value
+extract_json_value() {
+    local json_file="$1"
+    local key="$2"
+    
+    if command -v jq &> /dev/null; then
+        jq -r ".$key" "$json_file" 2>/dev/null
     else
-        print_error "Failed to run k8s_trivy_setup.sh"
-        return 1
+        # Fallback without jq
+        grep "\"$key\"" "$json_file" | sed 's/.*"'$key'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1
     fi
 }
 
-# Function to extract JSON value (fallback for systems without jq)
-extract_json_value() {
-    local json_file=$1
-    local key=$2
-    
-    if command -v jq &> /dev/null; then
-        jq -r ".$key" "$json_file"
-    else
-        # Fallback: use grep and sed for basic JSON parsing
-        grep "\"$key\"" "$json_file" | sed 's/.*"'$key'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | sed 's/.*"'$key'"[[:space:]]*:[[:space:]]*\([^",}]*\).*/\1/'
-    fi
-}
-# Function to create adjusted configuration
+# Function to create configuration
 create_config() {
-    local tunnel_url=$(cat $TUNNEL_URL_FILE)
-    print_step "Creating adjusted configuration for CyberChief..."
+    local tunnel_url
+    tunnel_url=$(cat "$TUNNEL_URL_FILE")
     
+    print_step "Creating configuration for CyberChief..."
+    
+    local token=""
     if [ -f "/tmp/trivy_output.json" ]; then
-        # Use trivy output as base and adjust for Cloudflare tunnel
-        local token=$(extract_json_value "/tmp/trivy_output.json" "token")
-        
-        print_step "Adjusting configuration for Cloudflare tunnel (clearing certificate_authority_data)..."
-        cat > $CONFIG_FILE << EOF
-{
-  "cluster_name": "$CLUSTER_NAME",
-  "server": "$tunnel_url",
-  "namespace": "$NAMESPACE",
-  "certificate_authority_data": "",
-  "token": "$token"
-}
-EOF
+        token=$(extract_json_value "/tmp/trivy_output.json" "token")
+        print_step "Using Trivy service account token"
     else
-        # Fallback: create config manually using kubectl with default service account
-        print_warning "Using fallback method to create configuration with default service account"
-        print_warning "Note: This may have limited permissions compared to the Trivy service account"
+        print_warning "Using default service account token"
         
-        # Get service account token using kubectl
-        local secret_name=$(kubectl -n kube-system get serviceaccount default -o jsonpath='{.secrets[0].name}' 2>/dev/null || echo "")
-        local token=""
+        # Try to get token
+        token=$(kubectl -n kube-system create token default 2>/dev/null || echo "")
         
-        if [ ! -z "$secret_name" ]; then
-            token=$(kubectl -n kube-system get secret "$secret_name" -o jsonpath='{.data.token}' 2>/dev/null | base64 --decode 2>/dev/null || echo "")
-        fi
-        
-        # Alternative method for newer Kubernetes versions
+        # Fallback for older Kubernetes versions
         if [ -z "$token" ]; then
-            token=$(kubectl -n kube-system create token default 2>/dev/null || echo "")
+            local secret_name
+            secret_name=$(kubectl -n kube-system get serviceaccount default -o jsonpath='{.secrets[0].name}' 2>/dev/null || echo "")
+            if [ -n "$secret_name" ]; then
+                token=$(kubectl -n kube-system get secret "$secret_name" -o jsonpath='{.data.token}' | base64 --decode 2>/dev/null || echo "")
+            fi
         fi
         
         if [ -z "$token" ]; then
             print_error "Could not retrieve service account token"
             exit 1
         fi
-        
-        cat > $CONFIG_FILE << EOF
+    fi
+    
+    cat > "$CONFIG_FILE" << EOF
 {
   "cluster_name": "$CLUSTER_NAME",
   "server": "$tunnel_url",
@@ -213,18 +240,14 @@ EOF
   "token": "$token"
 }
 EOF
-    fi
     
     print_success "Configuration saved to $CONFIG_FILE"
-    print_step "Key adjustments made for Cloudflare tunnel:"
-    echo "  - Server URL set to: $tunnel_url"
-    echo "  - certificate_authority_data cleared (empty string)"
-    echo "  - Token preserved from Trivy service account"
 }
 
-# Function to deploy Kubernetes Goat (optional)
+# Optional Kubernetes Goat deployment
 deploy_k8s_goat() {
-    read -p "Do you want to deploy Kubernetes Goat? (y/N): " deploy_goat
+    printf "Deploy Kubernetes Goat for testing? (y/N): "
+    read -r deploy_goat
     if [[ $deploy_goat =~ ^[Yy]$ ]]; then
         print_step "Deploying Kubernetes Goat..."
         if command -v git &> /dev/null; then
@@ -237,7 +260,7 @@ deploy_k8s_goat() {
             cd ..
             print_success "Kubernetes Goat deployed"
         else
-            print_warning "Git not found. Please manually deploy Kubernetes Goat following the official guide"
+            print_warning "Git not found. Please install git to deploy Kubernetes Goat"
         fi
     fi
 }
@@ -245,6 +268,9 @@ deploy_k8s_goat() {
 # Main execution
 main() {
     echo -e "${GREEN}=== Minikube + Cloudflare Tunnel Setup for CyberChief ===${NC}"
+    echo "Platform: $(uname -s) $(uname -m)"
+    echo ""
+    
     mkdir -p ./tmp
     
     # Check prerequisites
@@ -253,9 +279,9 @@ main() {
     check_command "minikube"
     check_command "cloudflared"
     check_command "kubectl"
-    # jq is optional - we'll use fallback methods if not available
+    
     if ! command -v jq &> /dev/null; then
-        print_warning "jq not found - using fallback JSON parsing methods"
+        print_warning "jq not found - using fallback JSON parsing"
     fi
     print_success "All prerequisites found"
     
@@ -271,57 +297,42 @@ main() {
     # Wait for API server
     wait_for_api_server
     
-    # Get Minikube port
-    local api_port=$(get_minikube_port)
+    # Get port and start tunnel
+    print_step "Finding Minikube API port..."
+    api_port=$(get_minikube_port)
     print_success "Found Minikube API port: $api_port"
     
-    # Start Cloudflare tunnel
-    start_tunnel $api_port
+    start_tunnel "$api_port"
     
-    # Optional: Deploy Kubernetes Goat
+    # Optional deployments and setup
     deploy_k8s_goat
-    
-    # Setup Trivy configuration
     setup_trivy_config
-    
-    # Create adjusted configuration
     create_config
     
-    echo -e "\n${GREEN}=== Setup Complete ===${NC}"
-    echo -e "Tunnel URL: $(cat $TUNNEL_URL_FILE)"
-    echo -e "Configuration file: $CONFIG_FILE"
-    echo -e "Tunnel PID: $(cat $TUNNEL_PID_FILE)"
-    echo -e "\n${YELLOW}Next steps:${NC}"
-    echo -e "1. Upload $CONFIG_FILE to CyberChief workspace"
-    echo -e "2. Run scans from CyberChief"
-    echo -e "3. When done, run the teardown script: ./k8s-cyberchief-teardown.sh"
-    echo -e "\n${YELLOW}Note:${NC} The Cloudflare tunnel is running in the background"
+    # Summary
+    echo ""
+    echo -e "${GREEN}=== Setup Complete ===${NC}"
+    echo "Tunnel URL: $(cat "$TUNNEL_URL_FILE")"
+    echo "Configuration: $CONFIG_FILE"
+    echo "Tunnel PID: $(cat "$TUNNEL_PID_FILE")"
+    echo ""
+    echo -e "${YELLOW}Next steps:${NC}"
+    echo "1. Upload $CONFIG_FILE to CyberChief"
+    echo "2. Run your scans"
+    echo "3. When done: ./teardown-k8s-cyberchief.sh"
+    echo ""
+    echo -e "${BLUE}Tunnel is running in background${NC}"
 }
 
-# Cleanup function for interruptions
+# Cleanup on interrupt
 cleanup() {
-    print_warning "Script interrupted, cleaning up..."
+    print_warning "Cleaning up..."
     if [ -f "$TUNNEL_PID_FILE" ]; then
-        local tunnel_pid=$(cat $TUNNEL_PID_FILE)
-        kill $tunnel_pid 2>/dev/null || true
-        rm -f $TUNNEL_PID_FILE
+        kill "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null || true
+        rm -f "$TUNNEL_PID_FILE"
     fi
     exit 1
 }
 
-# Set trap for cleanup
 trap cleanup INT TERM
-
-# Run main function
 main "$@"
-
-
-
-
-
-
-
-
-
-
-
